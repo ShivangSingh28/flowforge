@@ -81,7 +81,7 @@ The API listens on `http://localhost:3000` by default. `GET /health` is a livene
 
 ## Configuration and operations
 
-- Node.js 20 or newer
+- Node.js 22
 - npm
 
 ## Getting started
