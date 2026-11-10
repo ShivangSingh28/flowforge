@@ -1,0 +1,69 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum JobPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum JobAttemptStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model Job {
+  id             String        @id @default(uuid()) @db.Uuid
+  type           String
+  payload        Json           @db.JsonB
+  status         JobStatus      @default(PENDING)
+  priority       JobPriority    @default(MEDIUM)
+  attempts       Int            @default(0)
+  maxAttempts    Int            @default(3)
+  idempotencyKey String?        @unique
+  leaseToken     String?        @unique @db.Uuid
+  leaseExpiresAt DateTime?      @db.Timestamptz(6)
+  scheduledAt    DateTime?      @db.Timestamptz(6)
+  startedAt      DateTime?      @db.Timestamptz(6)
+  completedAt    DateTime?      @db.Timestamptz(6)
+  failedAt       DateTime?      @db.Timestamptz(6)
+  lastError      String?
+  createdAt      DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime       @updatedAt @db.Timestamptz(6)
+  jobAttempts    JobAttempt[]
+
+  @@index([status, createdAt])
+  @@index([status, priority])
+  @@index([type])
+  @@index([scheduledAt])
+}
+
+model JobAttempt {
+  id            String           @id @default(uuid()) @db.Uuid
+  jobId         String           @db.Uuid
+  attemptNumber Int
+  status        JobAttemptStatus
+  workerId      String?
+  startedAt     DateTime         @default(now()) @db.Timestamptz(6)
+  finishedAt    DateTime?        @db.Timestamptz(6)
+  error         String?
+  createdAt     DateTime         @default(now()) @db.Timestamptz(6)
+  job           Job              @relation(fields: [jobId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([jobId, attemptNumber])
+}
