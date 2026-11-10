@@ -1,14 +1,85 @@
 # FlowForge
 
-FlowForge is a foundation for a distributed background job processing system.
-This phase provides a strict TypeScript and Express HTTP service, validated
-environment configuration, PostgreSQL persistence through Prisma, request
-logging, centralized error handling, graceful shutdown, an atomic Transactional
-Outbox, a RabbitMQ publisher relay, and an independently
-runnable worker for the `demo` job type. Redis and scheduled jobs are
-intentionally not included.
+[![CI](https://github.com/ShivangSingh28/flowforge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ShivangSingh28/flowforge/actions/workflows/ci.yml)
+![Node.js 22](https://img.shields.io/badge/Node.js-22-339933?logo=node.js&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
+![RabbitMQ](https://img.shields.io/badge/RabbitMQ-4-FF6600?logo=rabbitmq&logoColor=white)
 
-## Requirements
+**FlowForge is a distributed background-job processing system** built with Node.js, strict TypeScript, Express, PostgreSQL, Prisma, and RabbitMQ.
+
+It separates job submission, reliable message publication, and job execution into three independently runnable processes:
+
+- **API** — validates submissions and atomically stores each job with an outbox event.
+- **Outbox Relay** — claims unpublished events and publishes persistent RabbitMQ messages with publisher confirms.
+- **Worker** — consumes messages, uses database-backed execution leases and fencing tokens, retries eligible failures, and acknowledges only after durable outcomes.
+
+The system is designed around **at-least-once delivery**, explicit recovery behavior, and safe handling of duplicate messages—not an exactly-once execution claim.
+
+**[Architecture & failure flows →](docs/architecture.md)** · **[CI workflow →](.github/workflows/ci.yml)**
+
+## Engineering highlights
+
+- Transactional Outbox: job + outbox event committed in one PostgreSQL transaction.
+- Concurrent relay claims using `FOR UPDATE SKIP LOCKED`, leases, and per-event lock tokens.
+- Persistent RabbitMQ publication with mandatory routing and publisher confirms.
+- Worker manual ACK, configurable prefetch, execution leases, heartbeat renewal, and fencing tokens.
+- Capped exponential backoff for publication and handler retries; durable dead-letter routing for malformed deliveries.
+- Bounded graceful shutdown, broker reconnect with backoff/jitter, readiness checks, and operational metrics.
+- Unit/HTTP tests plus isolated PostgreSQL/RabbitMQ integration tests for process and broker recovery.
+- GitHub Actions CI covering formatting, lint, Prisma validation, TypeScript, tests, build, and real-service integration tests.
+
+## Quick start
+
+### Requirements
+
+- Node.js 22
+- npm
+- Docker Engine / Docker Desktop with Docker Compose
+
+### Run locally
+
+```sh
+npm install
+```
+
+Create your local environment file:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Start PostgreSQL and RabbitMQ:
+
+```sh
+docker compose up -d postgres rabbitmq
+```
+
+Apply database migrations and start the API:
+
+```sh
+npm run prisma:migrate:dev
+npm run dev
+```
+
+Run the relay and worker in separate terminals:
+
+```sh
+npm run relay
+npm run worker
+```
+
+The API listens on `http://localhost:3000` by default. `GET /health` is a liveness check; `GET /health/ready` checks PostgreSQL readiness.
+
+## Documentation
+
+- [Architecture, component responsibilities, delivery guarantees, recovery, and testing](docs/architecture.md)
+- [CI workflow](.github/workflows/ci.yml)
+- [Environment variables, retry/lease tuning, worker crash-recovery walkthrough, integration testing, scripts, and project structure](#configuration-and-operations)
+
+---
+
+## Configuration and operations
 
 - Node.js 20 or newer
 - npm
