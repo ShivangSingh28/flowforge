@@ -86,9 +86,12 @@ The API listens on `http://localhost:3000` by default. `GET /health` is a livene
 
 ## Getting started
 
-```sh
+```powershell
 npm install
 Copy-Item .env.example .env
+```
+
+```sh
 docker compose up -d postgres rabbitmq
 npm run prisma:migrate:dev
 npm run dev
