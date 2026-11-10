@@ -1,16 +1,11 @@
 import type { Job, Prisma } from "@prisma/client";
 import { HttpError } from "../utils/http-error";
 import type { JobSubmissionInput } from "../types/job-submission";
-import type { JobMessage } from "../types/job-message";
 
 interface JobRepositoryPort {
-  create(input: JobSubmissionInput): Promise<Job>;
+  createSubmission(input: JobSubmissionInput): Promise<Job>;
   findByIdempotencyKey(idempotencyKey: string): Promise<Job | null>;
   isUniqueConstraintError(error: unknown): boolean;
-}
-
-interface JobPublisherPort {
-  publish(message: JobMessage): Promise<void>;
 }
 
 export interface JobSubmissionResult {
@@ -44,10 +39,7 @@ const isSameSubmission = (job: Job, input: JobSubmissionInput): boolean =>
   canonicalize(job.payload) === canonicalize(input.payload as Prisma.JsonValue);
 
 export class JobSubmissionService {
-  constructor(
-    private readonly repository: JobRepositoryPort,
-    private readonly publisher: JobPublisherPort,
-  ) {}
+  constructor(private readonly repository: JobRepositoryPort) {}
 
   async submit(input: JobSubmissionInput): Promise<JobSubmissionResult> {
     if (input.idempotencyKey) {
@@ -61,7 +53,7 @@ export class JobSubmissionService {
 
     let job: Job;
     try {
-      job = await this.repository.create(input);
+      job = await this.repository.createSubmission(input);
     } catch (error: unknown) {
       if (
         !input.idempotencyKey ||
@@ -78,30 +70,6 @@ export class JobSubmissionService {
       }
 
       return this.existingResult(existing, input);
-    }
-
-    const message: JobMessage = {
-      jobId: job.id,
-      type: job.type,
-      payload: input.payload,
-      priority: job.priority,
-      createdAt: job.createdAt.toISOString(),
-    };
-
-    try {
-      await this.publisher.publish(message);
-    } catch (error: unknown) {
-      console.error(
-        JSON.stringify({
-          event: "jobs.publish_failed",
-          jobId: job.id,
-          errorName: error instanceof Error ? error.name : "UnknownError",
-        }),
-      );
-      throw new HttpError(
-        503,
-        "Job was saved but could not be published; it remains pending",
-      );
     }
 
     return { job: { id: job.id, status: job.status }, created: true };

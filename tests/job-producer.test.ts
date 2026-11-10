@@ -41,7 +41,29 @@ describe("JobProducer", () => {
       persistent: true,
       contentType: "application/json",
       messageId: message.jobId,
+      mandatory: true,
     });
+  });
+
+  it("rejects broker-confirmed messages that RabbitMQ returned as unroutable", async () => {
+    const emitter = new EventEmitter();
+    const publish = jest.fn<ConfirmChannel["publish"]>(
+      (_exchange, _routingKey, _content, options, confirm) => {
+        emitter.emit("return", {
+          properties: { messageId: options?.messageId },
+        });
+        confirm?.(null, {});
+        return true;
+      },
+    );
+    const channel = Object.assign(emitter, {
+      publish,
+    }) as unknown as ConfirmChannel;
+    const producer = new JobProducer(() => channel);
+
+    await expect(producer.publish(message)).rejects.toThrow(
+      "RabbitMQ returned an unroutable message",
+    );
   });
 
   it("rejects negative broker acknowledgements", async () => {

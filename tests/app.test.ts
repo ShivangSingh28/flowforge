@@ -7,10 +7,15 @@ import {
   it,
   jest,
 } from "@jest/globals";
-import { JobPriority, JobStatus, type Job } from "@prisma/client";
+import {
+  JobPriority,
+  JobStatus,
+  type Job,
+  type OutboxEvent,
+} from "@prisma/client";
+import type { Prisma } from "@prisma/client";
 import { app } from "../src/app";
 import { prisma } from "../src/repositories/prisma";
-import { jobProducer } from "../src/queues/rabbitmq";
 
 describe("HTTP application", () => {
   beforeEach(() => {
@@ -90,7 +95,7 @@ describe("HTTP application", () => {
     );
   });
 
-  it("returns 201 after a new job is persisted and confirmed", async () => {
+  it("returns 201 after a new job and outbox event commit", async () => {
     const persistedJob = {
       id: "b23d9dd9-bd88-4fa2-81be-fb2fcf55fcb0",
       type: "email.send",
@@ -110,11 +115,29 @@ describe("HTTP application", () => {
       createdAt: new Date("2026-10-31T12:00:00.000Z"),
       updatedAt: new Date("2026-10-31T12:00:00.000Z"),
     } satisfies Job;
+    const createJob = jest
+      .fn<(args: Prisma.JobCreateArgs) => Promise<Job>>()
+      .mockResolvedValue(persistedJob);
+    const createOutboxEvent = jest
+      .fn<(args: Prisma.OutboxEventCreateArgs) => Promise<OutboxEvent>>()
+      .mockResolvedValue({} as OutboxEvent);
     jest.spyOn(prisma.job, "findUnique").mockResolvedValue(null);
-    jest.spyOn(prisma.job, "create").mockResolvedValue(persistedJob);
-    const publish = jest
-      .spyOn(jobProducer, "publish")
-      .mockResolvedValue(undefined);
+    const transaction = {
+      job: {
+        create: createJob,
+      },
+      outboxEvent: {
+        create: createOutboxEvent,
+      },
+    } as unknown as Prisma.TransactionClient;
+    const transact = jest
+      .spyOn(prisma, "$transaction")
+      .mockImplementation(async (callback) => {
+        if (typeof callback !== "function") {
+          throw new Error("Expected an interactive transaction");
+        }
+        return callback(transaction);
+      });
 
     const response = await request(app)
       .post("/api/jobs")
@@ -129,6 +152,12 @@ describe("HTTP application", () => {
       id: persistedJob.id,
       status: JobStatus.PENDING,
     });
-    expect(publish).toHaveBeenCalledTimes(1);
+    expect(transact).toHaveBeenCalledTimes(1);
+    expect(createOutboxEvent).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        jobId: persistedJob.id,
+        eventType: "job.submitted",
+      }),
+    });
   });
 });

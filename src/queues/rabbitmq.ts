@@ -1,7 +1,8 @@
 import { env } from "../config/env";
-import { JobProducer } from "../producers/job-producer";
 import { RabbitMQConnectionManager } from "./rabbitmq-connection-manager";
 
-export const rabbitMQ = new RabbitMQConnectionManager(env.RABBITMQ_URL);
+if (!env.RABBITMQ_URL) {
+  throw new Error("RABBITMQ_URL is required by the worker and outbox relay");
+}
 
-export const jobProducer = new JobProducer(() => rabbitMQ.getChannel());
+export const rabbitMQ = new RabbitMQConnectionManager(env.RABBITMQ_URL);

@@ -2,36 +2,11 @@ import type { Server } from "node:http";
 import { app } from "./app";
 import { env } from "./config/env";
 import { prisma } from "./repositories/prisma";
-import { rabbitMQ } from "./queues/rabbitmq";
-import { initializeRabbitMQTopology } from "./queues/topology";
 
 let server: Server | undefined;
 let isShuttingDown = false;
 
 const start = async (): Promise<void> => {
-  try {
-    const channel = await rabbitMQ.initialize();
-    await initializeRabbitMQTopology(channel);
-  } catch {
-    console.error(
-      "Application startup aborted because RabbitMQ initialization failed",
-    );
-    const cleanupResults = await Promise.allSettled([
-      rabbitMQ.close(),
-      prisma.$disconnect(),
-    ]);
-
-    cleanupResults.forEach((result, index) => {
-      if (result.status === "rejected") {
-        const resource = index === 0 ? "RabbitMQ" : "Prisma";
-        console.error(`Failed to clean up ${resource} after startup failure`);
-      }
-    });
-
-    process.exitCode = 1;
-    return;
-  }
-
   if (isShuttingDown) {
     return;
   }
@@ -73,14 +48,11 @@ const shutdown = (signal: NodeJS.Signals): void => {
 
   const shutdownResources = async (): Promise<void> => {
     const [httpResult] = await Promise.allSettled([closeHttpServer]);
-    const dependencyResults = await Promise.allSettled([
-      rabbitMQ.close(),
-      prisma.$disconnect(),
-    ]);
+    const dependencyResults = await Promise.allSettled([prisma.$disconnect()]);
 
     clearTimeout(timeout);
 
-    const resourceNames = ["HTTP server", "RabbitMQ", "Prisma"];
+    const resourceNames = ["HTTP server", "Prisma"];
     [httpResult, ...dependencyResults].forEach((result, index) => {
       if (result.status === "rejected") {
         console.error(

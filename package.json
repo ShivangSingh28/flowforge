@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "worker": "tsx src/workers/worker.ts",
+    "relay": "tsx src/relay/relay.ts",
     "start:worker": "node dist/workers/worker.js",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
@@ -14,6 +15,9 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "jest --runInBand",
+    "integration:up": "node scripts/integration-test.cjs up",
+    "integration:test": "node scripts/integration-test.cjs test",
+    "integration:down": "node scripts/integration-test.cjs down",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
     "prisma:migrate:dev": "prisma migrate dev"

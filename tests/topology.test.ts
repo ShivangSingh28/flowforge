@@ -2,6 +2,9 @@ import { EventEmitter } from "node:events";
 import { describe, expect, it, jest } from "@jest/globals";
 import type { ConfirmChannel } from "amqplib";
 import {
+  DEAD_LETTER_EXCHANGE,
+  DEAD_LETTER_QUEUE,
+  DEAD_LETTER_ROUTING_KEY,
   DEFAULT_JOB_ROUTING_KEY,
   DEFAULT_JOBS_QUEUE,
   JOBS_EXCHANGE,
@@ -44,6 +47,19 @@ describe("RabbitMQ topology", () => {
       JOBS_EXCHANGE,
       DEFAULT_JOB_ROUTING_KEY,
     );
+    expect(channel.assertExchange).toHaveBeenCalledWith(
+      DEAD_LETTER_EXCHANGE,
+      "direct",
+      { durable: true },
+    );
+    expect(channel.assertQueue).toHaveBeenCalledWith(DEAD_LETTER_QUEUE, {
+      durable: true,
+    });
+    expect(channel.bindQueue).toHaveBeenCalledWith(
+      DEAD_LETTER_QUEUE,
+      DEAD_LETTER_EXCHANGE,
+      DEAD_LETTER_ROUTING_KEY,
+    );
   });
 
   it("shares initialization when called repeatedly for the same channel", async () => {
@@ -54,8 +70,8 @@ describe("RabbitMQ topology", () => {
       initializeRabbitMQTopology(channel),
     ]);
 
-    expect(channel.assertExchange).toHaveBeenCalledTimes(1);
-    expect(channel.assertQueue).toHaveBeenCalledTimes(1);
-    expect(channel.bindQueue).toHaveBeenCalledTimes(1);
+    expect(channel.assertExchange).toHaveBeenCalledTimes(2);
+    expect(channel.assertQueue).toHaveBeenCalledTimes(2);
+    expect(channel.bindQueue).toHaveBeenCalledTimes(2);
   });
 });

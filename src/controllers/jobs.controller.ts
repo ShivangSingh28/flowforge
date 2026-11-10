@@ -1,13 +1,9 @@
 import type { RequestHandler } from "express";
 import { JobRepository } from "../repositories/job.repository";
-import { jobProducer } from "../queues/rabbitmq";
 import { JobSubmissionService } from "../services/job-submission.service";
 import { jobSubmissionSchema } from "../types/job-submission";
 
-const jobSubmissionService = new JobSubmissionService(
-  new JobRepository(),
-  jobProducer,
-);
+const jobSubmissionService = new JobSubmissionService(new JobRepository());
 
 export const submitJob: RequestHandler = async (request, response) => {
   const input = jobSubmissionSchema.parse(request.body);

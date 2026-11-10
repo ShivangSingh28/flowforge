@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${FLOWFORGE_INTEGRATION_POSTGRES_USER:?Set dedicated integration PostgreSQL user}
+      POSTGRES_PASSWORD: ${FLOWFORGE_INTEGRATION_POSTGRES_PASSWORD:?Set dedicated integration PostgreSQL password}
+      POSTGRES_DB: ${FLOWFORGE_INTEGRATION_POSTGRES_DB:?Set dedicated integration PostgreSQL database}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - integration_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${FLOWFORGE_INTEGRATION_RABBITMQ_USER:?Set dedicated integration RabbitMQ user}
+      RABBITMQ_DEFAULT_PASS: ${FLOWFORGE_INTEGRATION_RABBITMQ_PASSWORD:?Set dedicated integration RabbitMQ password}
+    ports:
+      - "127.0.0.1:5673:5672"
+      - "127.0.0.1:15673:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  integration_postgres_data:
+    name: flowforge_integration_postgres_data

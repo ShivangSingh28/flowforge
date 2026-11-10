@@ -44,6 +44,14 @@ const createHarness = (
     ack: jest.fn<ConfirmChannel["ack"]>(),
     nack: jest.fn<ConfirmChannel["nack"]>(),
     reject: jest.fn<ConfirmChannel["reject"]>(),
+    publish: jest
+      .fn<ConfirmChannel["publish"]>()
+      .mockImplementation(
+        (_exchange, _routingKey, _content, _options, callback) => {
+          callback?.(null, {});
+          return true;
+        },
+      ),
   }) as unknown as ConfirmChannel;
   const consumer = new JobConsumer(
     channel,
@@ -105,7 +113,7 @@ describe("JobConsumer", () => {
     expect(channel.nack).not.toHaveBeenCalled();
   });
 
-  it("rejects malformed messages without requeue", async () => {
+  it("confirms malformed messages to the dead-letter exchange before ACK", async () => {
     const execute = jest.fn<JobExecutionService["execute"]>();
     const { channel, consumer, deliver } = createHarness(execute);
     const delivery = createDelivery("{");
@@ -114,7 +122,9 @@ describe("JobConsumer", () => {
     deliver(delivery);
     await consumer.stop();
 
-    expect(channel.reject).toHaveBeenCalledWith(delivery, false);
+    expect(channel.publish).toHaveBeenCalled();
+    expect(channel.ack).toHaveBeenCalledWith(delivery);
+    expect(channel.reject).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -134,7 +144,7 @@ describe("JobConsumer", () => {
     expect(channel.ack).not.toHaveBeenCalled();
   });
 
-  it("waits for in-flight work after cancelling the consumer", async () => {
+  it("allows in-flight durable work to finish during graceful shutdown", async () => {
     let finishExecution: ((value: "ack") => void) | undefined;
     const execute = jest.fn<JobExecutionService["execute"]>(
       () =>
@@ -157,7 +167,7 @@ describe("JobConsumer", () => {
     finishExecution?.("ack");
     await stopping;
     expect(stopped).toBe(true);
-    expect(channel.ack).not.toHaveBeenCalled();
+    expect(channel.ack).toHaveBeenCalledTimes(1);
   });
 
   it("leaves a deferred redelivery unacknowledged", async () => {

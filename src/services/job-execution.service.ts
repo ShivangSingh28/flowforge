@@ -4,6 +4,7 @@ import { env } from "../config/env";
 import type {
   ClaimedJob,
   ClaimJobOptions,
+  FailureMutationResult,
   LeaseMutationResult,
 } from "../repositories/job-execution.repository";
 import type { JobMessage } from "../types/job-message";
@@ -34,10 +35,15 @@ interface JobExecutionRepositoryPort {
     attemptId: string,
     leaseToken: string,
     safeError: string,
-  ): Promise<LeaseMutationResult>;
+    retryable?: boolean,
+    retryDelayMs?: number,
+  ): Promise<FailureMutationResult>;
 }
 
-type ClaimedExecutionResult = "terminal" | "ownership_lost" | "cancelled";
+type ClaimedExecutionResult =
+  "terminal" | "retry_scheduled" | "ownership_lost" | "cancelled";
+
+export class TerminalJobError extends Error {}
 
 const demoHandler: JobHandler = async (job) => {
   const payloadFields =
@@ -105,6 +111,8 @@ export class JobExecutionService {
     private readonly leaseDurationMs = env.WORKER_LEASE_DURATION_MS,
     private readonly heartbeatIntervalMs = env.WORKER_HEARTBEAT_INTERVAL_MS,
     private readonly nodeEnvironment: WorkerEnvironment = env.NODE_ENV,
+    private readonly retryBaseDelayMs = env.JOB_RETRY_BASE_DELAY_MS,
+    private readonly retryMaxDelayMs = env.JOB_RETRY_MAX_DELAY_MS,
   ) {}
 
   async execute(
@@ -146,6 +154,9 @@ export class JobExecutionService {
         if (result === "terminal") {
           return "ack";
         }
+        if (result === "retry_scheduled") {
+          continue;
+        }
         if (result === "cancelled") {
           return "defer";
         }
@@ -165,7 +176,9 @@ export class JobExecutionService {
       const untilExpiry =
         current.status === JobStatus.PROCESSING && current.leaseExpiresAt
           ? Math.max(1, current.leaseExpiresAt.getTime() - Date.now())
-          : this.heartbeatIntervalMs;
+          : current.status === JobStatus.PENDING && current.scheduledAt
+            ? Math.max(1, current.scheduledAt.getTime() - Date.now())
+            : this.heartbeatIntervalMs;
       const shouldContinue = await abortableDelay(
         Math.min(this.heartbeatIntervalMs, untilExpiry),
         signal,
@@ -254,7 +267,7 @@ export class JobExecutionService {
           return { cancelled: true as const };
         }
         if (!handler) {
-          throw new Error("No handler registered");
+          throw new TerminalJobError("No handler registered");
         }
         const result = await handler(claimed.job, handlerController.signal);
         return { cancelled: false as const, succeeded: true as const, result };
@@ -300,8 +313,30 @@ export class JobExecutionService {
           claimed.attempt.id,
           claimed.leaseToken,
           "Job execution failed",
+          !(outcome.error instanceof TerminalJobError),
+          Math.min(
+            this.retryMaxDelayMs,
+            this.retryBaseDelayMs *
+              2 ** Math.min(Math.max(claimed.job.attempts - 1, 0), 30),
+          ),
         );
         if (persisted !== "updated") {
+          if (persisted === "retry_scheduled") {
+            console.warn(
+              JSON.stringify({
+                event: "worker.job_retry_scheduled",
+                jobId: claimed.job.id,
+                attemptId: claimed.attempt.id,
+                attempt: claimed.job.attempts,
+                retryDelayMs: Math.min(
+                  this.retryMaxDelayMs,
+                  this.retryBaseDelayMs *
+                    2 ** Math.min(Math.max(claimed.job.attempts - 1, 0), 30),
+                ),
+              }),
+            );
+            return "retry_scheduled";
+          }
           return "ownership_lost";
         }
         console.error(

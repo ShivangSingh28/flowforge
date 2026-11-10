@@ -19,6 +19,7 @@ export interface ClaimJobOptions {
 }
 
 export type LeaseMutationResult = "updated" | "lost_lease";
+export type FailureMutationResult = LeaseMutationResult | "retry_scheduled";
 
 export class JobExecutionRepository {
   constructor(private readonly client: PrismaClient = prisma) {}
@@ -38,10 +39,13 @@ export class JobExecutionRepository {
           attempts: number;
           leaseToken: string | null;
           leaseExpiresAt: Date | null;
+          scheduledAt: Date | null;
+          maxAttempts: number;
           databaseNow: Date;
         }>
       >`
-        SELECT "status", "attempts", "leaseToken", "leaseExpiresAt",
+        SELECT "status", "attempts", "maxAttempts", "scheduledAt",
+               "leaseToken", "leaseExpiresAt",
                clock_timestamp() AS "databaseNow"
         FROM "Job"
         WHERE "id" = ${id}::uuid
@@ -56,7 +60,38 @@ export class JobExecutionRepository {
         current.status === JobStatus.PROCESSING &&
         current.leaseExpiresAt !== null &&
         current.leaseExpiresAt <= current.databaseNow;
+      if (
+        current.status === JobStatus.PENDING &&
+        current.scheduledAt !== null &&
+        current.scheduledAt > current.databaseNow
+      ) {
+        return null;
+      }
       if (current.status !== JobStatus.PENDING && !expiredProcessing) {
+        return null;
+      }
+
+      if (current.attempts >= current.maxAttempts) {
+        if (expiredProcessing) {
+          await transaction.jobAttempt.updateMany({
+            where: { jobId: id, status: JobAttemptStatus.PROCESSING },
+            data: {
+              status: JobAttemptStatus.FAILED,
+              finishedAt: current.databaseNow,
+              error: "Execution lease expired; retry limit exhausted",
+            },
+          });
+        }
+        await transaction.$executeRaw`
+          UPDATE "Job"
+          SET "status" = 'FAILED',
+              "failedAt" = clock_timestamp(),
+              "updatedAt" = clock_timestamp(),
+              "lastError" = COALESCE("lastError", 'Maximum attempts exhausted'),
+              "leaseToken" = NULL,
+              "leaseExpiresAt" = NULL
+          WHERE "id" = ${id}::uuid
+        `;
         return null;
       }
 
@@ -69,6 +104,7 @@ export class JobExecutionRepository {
             "startedAt" = clock_timestamp(),
             "updatedAt" = clock_timestamp(),
             "leaseToken" = ${leaseToken}::uuid,
+            "scheduledAt" = NULL,
             "leaseExpiresAt" = clock_timestamp()
               + (${options.leaseDurationMs} * INTERVAL '1 millisecond')
         WHERE "id" = ${id}::uuid
@@ -177,12 +213,39 @@ export class JobExecutionRepository {
     attemptId: string,
     leaseToken: string,
     safeError: string,
-  ): Promise<LeaseMutationResult> {
+    retryable = false,
+    retryDelayMs = 0,
+  ): Promise<FailureMutationResult> {
     return this.client.$transaction(async (transaction) => {
+      const currentRows = await transaction.$queryRaw<
+        Array<{ attempts: number; maxAttempts: number }>
+      >`
+        SELECT "attempts", "maxAttempts"
+        FROM "Job"
+        WHERE "id" = ${jobId}::uuid
+          AND "status" = 'PROCESSING'
+          AND "leaseToken" = ${leaseToken}::uuid
+          AND "leaseExpiresAt" > clock_timestamp()
+        FOR UPDATE
+      `;
+      const current = currentRows[0];
+      if (!current) {
+        return "lost_lease";
+      }
+      const retryScheduled =
+        retryable && current.attempts < current.maxAttempts;
       const jobUpdate = await transaction.$executeRaw`
         UPDATE "Job"
-        SET "status" = 'FAILED',
-            "failedAt" = clock_timestamp(),
+        SET "status" = CASE
+              WHEN ${retryScheduled} THEN 'PENDING'::"JobStatus"
+              ELSE 'FAILED'::"JobStatus"
+            END,
+            "failedAt" = CASE WHEN ${retryScheduled} THEN NULL ELSE clock_timestamp() END,
+            "scheduledAt" = CASE
+              WHEN ${retryScheduled}
+                THEN clock_timestamp() + (${retryDelayMs} * INTERVAL '1 millisecond')
+              ELSE NULL
+            END,
             "updatedAt" = clock_timestamp(),
             "lastError" = ${safeError},
             "leaseToken" = NULL,
@@ -212,7 +275,7 @@ export class JobExecutionRepository {
       if (attemptUpdate.count !== 1) {
         throw new Error("Job failure state changed unexpectedly");
       }
-      return "updated";
+      return retryScheduled ? "retry_scheduled" : "updated";
     });
   }
 }

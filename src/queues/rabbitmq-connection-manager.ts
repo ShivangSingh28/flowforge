@@ -3,6 +3,8 @@ import amqp, {
   type ConfirmChannel,
   type Connection,
 } from "amqplib";
+import { EventEmitter } from "node:events";
+import { abortableDelay } from "../utils/abortable-delay";
 
 type Connect = (url: string) => Promise<ChannelModel>;
 type ErrorDetailKey = "code" | "syscall" | "address" | "port";
@@ -27,6 +29,7 @@ export class RabbitMQConnectionManager {
   private channel: ConfirmChannel | undefined;
   private initialization: Promise<ConfirmChannel> | undefined;
   private closing: Promise<void> | undefined;
+  private readonly events = new EventEmitter();
 
   private readonly brokerHost: string;
 
@@ -41,7 +44,6 @@ export class RabbitMQConnectionManager {
     if (this.channel && this.connection) {
       return Promise.resolve(this.channel);
     }
-
     if (this.closing) {
       return Promise.reject(
         new Error("Cannot initialize RabbitMQ while it is closing"),
@@ -60,6 +62,66 @@ export class RabbitMQConnectionManager {
         this.initialization = undefined;
       }
     });
+  }
+
+  get isConnected(): boolean {
+    return Boolean(this.connection && this.channel);
+  }
+
+  onDisconnected(listener: () => void): () => void {
+    this.events.on("disconnected", listener);
+    return () => this.events.off("disconnected", listener);
+  }
+
+  waitForDisconnect(signal?: AbortSignal): Promise<void> {
+    if (!this.isConnected || signal?.aborted) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve) => {
+      const finish = (): void => {
+        this.events.off("disconnected", finish);
+        signal?.removeEventListener("abort", finish);
+        resolve();
+      };
+      this.events.once("disconnected", finish);
+      signal?.addEventListener("abort", finish, { once: true });
+    });
+  }
+
+  async initializeWithRetry(
+    signal: AbortSignal,
+    baseDelayMs: number,
+    maxDelayMs: number,
+  ): Promise<ConfirmChannel | undefined> {
+    let failures = 0;
+    while (!signal.aborted) {
+      try {
+        return await this.initialize();
+      } catch {
+        if (signal.aborted) {
+          return undefined;
+        }
+        const ceiling = Math.min(
+          maxDelayMs,
+          baseDelayMs * 2 ** Math.min(failures, 30),
+        );
+        const delay = Math.floor(ceiling * (0.5 + Math.random() * 0.5));
+        failures += 1;
+        console.warn(
+          JSON.stringify({
+            event: "rabbitmq.reconnect_scheduled",
+            attempt: failures,
+            delayMs: delay,
+            brokerHost: this.brokerHost,
+          }),
+        );
+        if (!(await abortableDelay(delay, signal))) {
+          return undefined;
+        }
+      }
+    }
+    return undefined;
   }
 
   getConnection(): Connection {
@@ -107,16 +169,11 @@ export class RabbitMQConnectionManager {
 
     connection.on("error", (error: Error) => {
       this.logError("rabbitmq.connection_error", error);
+      this.invalidate(connection);
     });
 
     connection.on("close", () => {
-      if (this.connection === connection) {
-        this.connection = undefined;
-        this.channel = undefined;
-        console.error(
-          JSON.stringify({ event: "rabbitmq.connection_closed_unexpectedly" }),
-        );
-      }
+      this.invalidate(connection);
     });
 
     let channel: ConfirmChannel;
@@ -148,15 +205,11 @@ export class RabbitMQConnectionManager {
 
     channel.on("error", (error: Error) => {
       this.logError("rabbitmq.channel_error", error);
+      this.invalidate(connection);
     });
 
     channel.on("close", () => {
-      if (this.channel === channel) {
-        this.channel = undefined;
-        console.error(
-          JSON.stringify({ event: "rabbitmq.channel_closed_unexpectedly" }),
-        );
-      }
+      this.invalidate(connection);
     });
 
     console.info(
@@ -192,6 +245,19 @@ export class RabbitMQConnectionManager {
     }
 
     console.error(JSON.stringify(details));
+  }
+
+  private invalidate(connection: ChannelModel): void {
+    if (this.connection !== connection) {
+      return;
+    }
+    this.connection = undefined;
+    this.channel = undefined;
+    console.error(JSON.stringify({ event: "rabbitmq.connection_unavailable" }));
+    this.events.emit("disconnected");
+    void connection.close().catch((error: unknown) => {
+      this.logError("rabbitmq.invalid_connection_close_failed", error);
+    });
   }
 
   private redactCredentials(message: string): string {

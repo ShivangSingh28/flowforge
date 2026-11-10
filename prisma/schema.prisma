@@ -30,27 +30,46 @@ enum JobAttemptStatus {
 model Job {
   id             String        @id @default(uuid()) @db.Uuid
   type           String
-  payload        Json           @db.JsonB
-  status         JobStatus      @default(PENDING)
-  priority       JobPriority    @default(MEDIUM)
-  attempts       Int            @default(0)
-  maxAttempts    Int            @default(3)
-  idempotencyKey String?        @unique
-  leaseToken     String?        @unique @db.Uuid
-  leaseExpiresAt DateTime?      @db.Timestamptz(6)
-  scheduledAt    DateTime?      @db.Timestamptz(6)
-  startedAt      DateTime?      @db.Timestamptz(6)
-  completedAt    DateTime?      @db.Timestamptz(6)
-  failedAt       DateTime?      @db.Timestamptz(6)
+  payload        Json          @db.JsonB
+  status         JobStatus     @default(PENDING)
+  priority       JobPriority   @default(MEDIUM)
+  attempts       Int           @default(0)
+  maxAttempts    Int           @default(3)
+  idempotencyKey String?       @unique
+  leaseToken     String?       @unique @db.Uuid
+  leaseExpiresAt DateTime?     @db.Timestamptz(6)
+  scheduledAt    DateTime?     @db.Timestamptz(6)
+  startedAt      DateTime?     @db.Timestamptz(6)
+  completedAt    DateTime?     @db.Timestamptz(6)
+  failedAt       DateTime?     @db.Timestamptz(6)
   lastError      String?
-  createdAt      DateTime       @default(now()) @db.Timestamptz(6)
-  updatedAt      DateTime       @updatedAt @db.Timestamptz(6)
+  createdAt      DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime      @updatedAt @db.Timestamptz(6)
   jobAttempts    JobAttempt[]
+  outboxEvents   OutboxEvent[]
 
   @@index([status, createdAt])
   @@index([status, priority])
   @@index([type])
   @@index([scheduledAt])
+}
+
+model OutboxEvent {
+  id          String    @id @default(uuid()) @db.Uuid
+  jobId       String    @db.Uuid
+  eventType   String
+  payload     Json      @db.JsonB
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  availableAt DateTime  @default(now()) @db.Timestamptz(6)
+  attempts    Int       @default(0)
+  lockedUntil DateTime? @db.Timestamptz(6)
+  lockToken   String?   @db.Uuid
+  publishedAt DateTime? @db.Timestamptz(6)
+  lastError   String?
+  job         Job       @relation(fields: [jobId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([jobId, eventType])
+  @@index([publishedAt, availableAt, createdAt], map: "OutboxEvent_due_idx")
 }
 
 model JobAttempt {

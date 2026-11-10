@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate FlowForge
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: postgresql://flowforge_ci:flowforge_ci@127.0.0.1:5432/flowforge_ci?schema=public
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        timeout-minutes: 10
+
+      - name: Generate Prisma client
+        run: npm run prisma:generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check -- --ignore-unknown
+
+      - name: Validate Prisma schema
+        run: npm run prisma:validate
+
+      - name: Type-check production code
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: Type-check tests
+        run: npx tsc --noEmit -p tsconfig.test.json
+
+      - name: Run unit tests
+        run: npm test
+        timeout-minutes: 10
+
+      - name: Build production code
+        run: npm run build
+
+      - name: Create isolated integration environment
+        run: |
+          cat > .env.integration <<'EOF'
+          FLOWFORGE_INTEGRATION_POSTGRES_USER=flowforge_integration_ci
+          FLOWFORGE_INTEGRATION_POSTGRES_PASSWORD=flowforge_integration_ci_password
+          FLOWFORGE_INTEGRATION_POSTGRES_DB=flowforge_integration
+          FLOWFORGE_INTEGRATION_DATABASE_URL=postgresql://flowforge_integration_ci:flowforge_integration_ci_password@127.0.0.1:55432/flowforge_integration?schema=public
+          FLOWFORGE_INTEGRATION_RABBITMQ_USER=flowforge_integration_ci
+          FLOWFORGE_INTEGRATION_RABBITMQ_PASSWORD=flowforge_integration_ci_password
+          FLOWFORGE_INTEGRATION_RABBITMQ_URL=amqp://flowforge_integration_ci:flowforge_integration_ci_password@127.0.0.1:5673
+          EOF
+
+      - name: Run real PostgreSQL and RabbitMQ integration tests
+        run: |
+          set -o pipefail
+          npm run integration:test 2>&1 | tee integration-test.log
+        timeout-minutes: 25
+
+      - name: Capture isolated service logs on failure
+        if: failure()
+        run: |
+          docker compose \
+            --env-file .env.integration \
+            --project-name flowforge-integration \
+            -f docker-compose.integration.yml \
+            logs --no-color > integration-services.log 2>&1 || true
+
+      - name: Stop isolated integration services
+        if: always()
+        run: |
+          if [ -f .env.integration ]; then
+            npm run integration:down
+          else
+            echo "Integration environment was not created; cleanup is not needed."
+          fi
+        timeout-minutes: 5
+
+      - name: Upload integration logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowforge-integration-failure-logs
+          path: |
+            integration-test.log
+            integration-services.log
+          if-no-files-found: ignore
+          retention-days: 7

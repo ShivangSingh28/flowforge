@@ -33,4 +33,20 @@ export default tseslint.config(
       },
     },
   },
+  {
+    files: ["jest.integration.config.cjs", "scripts/**/*.cjs"],
+    languageOptions: {
+      globals: {
+        __dirname: "readonly",
+        console: "readonly",
+        module: "readonly",
+        process: "readonly",
+        require: "readonly",
+        URL: "readonly",
+      },
+    },
+    rules: {
+      "@typescript-eslint/no-require-imports": "off",
+    },
+  },
 );

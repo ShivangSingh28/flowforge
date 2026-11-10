@@ -14,6 +14,7 @@ import {
 } from "@jest/globals";
 import type {
   ClaimedJob,
+  FailureMutationResult,
   LeaseMutationResult,
 } from "../src/repositories/job-execution.repository";
 import type { JobMessage } from "../src/types/job-message";
@@ -137,7 +138,7 @@ const createHarness = (
         attemptId: string,
         leaseToken: string,
         safeError: string,
-      ) => Promise<LeaseMutationResult>
+      ) => Promise<FailureMutationResult>
     >()
     .mockResolvedValue("updated");
   const repository = {
@@ -169,6 +170,7 @@ describe("JobExecutionService", () => {
   beforeEach(() => {
     jest.spyOn(console, "info").mockImplementation(() => {});
     jest.spyOn(console, "error").mockImplementation(() => {});
+    jest.spyOn(console, "warn").mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -249,6 +251,8 @@ describe("JobExecutionService", () => {
       claimed.attempt.id,
       claimed.leaseToken,
       "Job execution failed",
+      false,
+      1000,
     );
   });
 
@@ -451,6 +455,31 @@ describe("JobExecutionService", () => {
       claimed.attempt.id,
       claimed.leaseToken,
       "Job execution failed",
+      true,
+      1000,
+    );
+  });
+
+  it("continues after durably scheduling a retry", async () => {
+    const { service, findById, markFailed } = createHarness(
+      JobStatus.PENDING,
+      async () => {
+        throw new Error("temporary failure");
+      },
+    );
+    findById
+      .mockResolvedValueOnce(makeJob(JobStatus.PENDING))
+      .mockResolvedValueOnce(makeJob(JobStatus.COMPLETED));
+    markFailed.mockResolvedValueOnce("retry_scheduled");
+
+    await expect(service.execute(message)).resolves.toBe("ack");
+    expect(markFailed).toHaveBeenCalledWith(
+      message.jobId,
+      claimed.attempt.id,
+      claimed.leaseToken,
+      "Job execution failed",
+      true,
+      1000,
     );
   });
 
