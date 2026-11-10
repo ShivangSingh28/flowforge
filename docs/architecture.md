@@ -13,7 +13,7 @@ flowchart LR
     MQ -->|Manual ACK consumer| Worker[Worker Process]
     Worker -->|Claim / heartbeat / result| DB
     Worker -->|ACK after durable outcome| MQ
-    MQ -->|Malformed or invalid delivery| DLQ[(Dead-letter Queue)]
+    Worker -->|Malformed or invalid delivery| DLQ[(Dead-letter Queue)]
 ```
 
 ### Runtime components
