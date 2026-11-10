@@ -30,6 +30,7 @@ interface ChildRuntime {
   child: ChildProcess;
   output(): string;
   waitForOutput(marker: string, timeoutMs?: number): Promise<void>;
+  waitForHealthPort(timeoutMs?: number): Promise<number>;
   waitForOutputCount(
     marker: string,
     count: number,
@@ -40,17 +41,11 @@ interface ChildRuntime {
   waitForExit(timeoutMs?: number): Promise<void>;
   signal(name: NodeJS.Signals): Promise<void>;
   kill(): Promise<void>;
+  stop(): Promise<void>;
 }
 
 const createdJobIds: string[] = [];
 const createdQueues: string[] = [];
-const tsxCli = path.join(
-  process.cwd(),
-  "node_modules",
-  "tsx",
-  "dist",
-  "cli.mjs",
-);
 const integrationComposeArgs = [
   "compose",
   "--env-file",
@@ -70,7 +65,7 @@ const startChild = (
 ): ChildRuntime => {
   const child = spawn(
     process.execPath,
-    [tsxCli, path.join(process.cwd(), sourceFile)],
+    ["--import", "tsx", path.join(process.cwd(), sourceFile)],
     {
       cwd: process.cwd(),
       env: {
@@ -87,14 +82,28 @@ const startChild = (
     },
   );
   let logs = "";
+  let spawnError: Error | undefined;
+  let closed = false;
   if (!child.stdout || !child.stderr) {
     throw new Error("Child process output streams were not created");
   }
-  child.stdout.on("data", (chunk: Buffer) => {
+  const onSpawnError = (error: Error): void => {
+    spawnError = error;
+  };
+  const onStdoutData = (chunk: Buffer): void => {
     logs += chunk.toString();
-  });
-  child.stderr.on("data", (chunk: Buffer) => {
+  };
+  const onStderrData = (chunk: Buffer): void => {
     logs += chunk.toString();
+  };
+  child.on("error", onSpawnError);
+  child.stdout.on("data", onStdoutData);
+  child.stderr.on("data", onStderrData);
+  child.once("close", () => {
+    closed = true;
+    child.stdout?.off("data", onStdoutData);
+    child.stderr?.off("data", onStderrData);
+    child.off("error", onSpawnError);
   });
 
   const waitForOutput = async (
@@ -103,7 +112,10 @@ const startChild = (
   ): Promise<void> => {
     const deadline = Date.now() + timeoutMs;
     while (!logs.includes(marker)) {
-      if (child.exitCode !== null || child.signalCode !== null) {
+      if (spawnError) {
+        throw spawnError;
+      }
+      if (closed) {
         throw new Error(`Child exited before ${marker}: ${logs}`);
       }
       if (Date.now() >= deadline) {
@@ -112,20 +124,59 @@ const startChild = (
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
   };
+  const waitForHealthPort = async (timeoutMs = 15000): Promise<number> => {
+    const marker = '"event":"process.health_started"';
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (spawnError) {
+        throw spawnError;
+      }
+      const line = logs.split(/\r?\n/).find((entry) => entry.includes(marker));
+      if (line) {
+        try {
+          const event: unknown = JSON.parse(line);
+          if (
+            typeof event === "object" &&
+            event !== null &&
+            "port" in event &&
+            typeof event.port === "number" &&
+            Number.isInteger(event.port) &&
+            event.port > 0 &&
+            event.port <= 65535
+          ) {
+            return event.port;
+          }
+        } catch {
+          // Wait for the complete JSON log line.
+        }
+      }
+      if (closed) {
+        throw new Error(
+          `Child exited before reporting its health port: ${logs}`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`Timed out waiting for the child health port: ${logs}`);
+  };
   const waitForExit = async (timeoutMs = 15000): Promise<void> => {
-    if (child.exitCode !== null || child.signalCode !== null) {
+    if (closed) {
       return;
     }
     await new Promise<void>((resolve, reject) => {
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        child.off("close", onClose);
+      };
       const timer = setTimeout(() => {
-        child.off("exit", onExit);
+        cleanup();
         reject(new Error(`Child did not exit: ${logs}`));
       }, timeoutMs);
-      const onExit = (): void => {
-        clearTimeout(timer);
+      const onClose = (): void => {
+        cleanup();
         resolve();
       };
-      child.once("exit", onExit);
+      child.once("close", onClose);
     });
   };
   const waitForOutputCount = async (
@@ -136,7 +187,10 @@ const startChild = (
     const deadline = Date.now() + timeoutMs;
     const occurrences = (): number => logs.split(marker).length - 1;
     while (occurrences() < count) {
-      if (child.exitCode !== null || child.signalCode !== null) {
+      if (spawnError) {
+        throw spawnError;
+      }
+      if (closed) {
         throw new Error(
           `Child exited before ${marker} occurred ${count} times: ${logs}`,
         );
@@ -154,18 +208,28 @@ const startChild = (
     child,
     output: () => logs,
     waitForOutput,
+    waitForHealthPort,
     waitForOutputCount,
     async sendMessage(message): Promise<void> {
       if (!child.connected) {
         throw new Error("Child process IPC channel is not connected");
       }
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error(`Child IPC send timed out: ${logs}`)),
-          5000,
-        );
-        child.send(message, (error) => {
+        const cleanup = (): void => {
           clearTimeout(timer);
+          child.off("close", onClose);
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`Child IPC send timed out: ${logs}`));
+        }, 5000);
+        const onClose = (): void => {
+          cleanup();
+          reject(new Error(`Child exited before IPC send completed: ${logs}`));
+        };
+        child.once("close", onClose);
+        child.send(message, (error) => {
+          cleanup();
           if (error) {
             reject(error);
           } else {
@@ -181,7 +245,7 @@ const startChild = (
     },
     waitForExit,
     async signal(name): Promise<void> {
-      if (child.exitCode === null && child.signalCode === null) {
+      if (!closed) {
         child.kill(name);
         await waitForExit();
       }
@@ -189,7 +253,49 @@ const startChild = (
     async kill(): Promise<void> {
       await this.signal("SIGKILL");
     },
+    async stop(): Promise<void> {
+      if (closed) {
+        return;
+      }
+
+      let gracefulError: unknown;
+      try {
+        child.kill("SIGTERM");
+        await waitForExit(3000);
+        return;
+      } catch (error: unknown) {
+        gracefulError = error;
+      }
+
+      try {
+        if (!closed) {
+          child.kill("SIGKILL");
+        }
+        await waitForExit(5000);
+      } catch (forceKillError: unknown) {
+        throw new AggregateError(
+          [gracefulError, forceKillError],
+          "Child process did not exit after graceful and forced termination",
+        );
+      }
+    },
   };
+};
+
+const stopChildren = async (
+  ...children: Array<ChildRuntime | undefined>
+): Promise<void> => {
+  const results = await Promise.allSettled(
+    children
+      .filter((child): child is ChildRuntime => child !== undefined)
+      .map((child) => child.stop()),
+  );
+  const errors = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Failed to clean up child processes");
+  }
 };
 
 const waitFor = async (
@@ -224,7 +330,7 @@ const runIntegrationCompose = (args: string[]): void => {
 };
 
 const getHealth = async (
-  port: string,
+  port: number | string,
   pathName: string,
 ): Promise<{ status: number; body: Record<string, unknown> }> => {
   const response = await fetch(`http://127.0.0.1:${port}${pathName}`);
@@ -316,7 +422,7 @@ const relayEnvironment = (
   routingKey: string,
   overrides: Record<string, string> = {},
 ): Record<string, string> => ({
-  OUTBOX_HEALTH_PORT: randomPort(),
+  OUTBOX_HEALTH_PORT: "0",
   OUTBOX_ROUTING_KEY: routingKey,
   OUTBOX_LEASE_DURATION_MS: "3000",
   OUTBOX_PUBLISH_CONFIRM_TIMEOUT_MS: "500",
@@ -365,7 +471,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
     try {
       await api.waitForOutput("FlowForge API listening");
     } finally {
-      await api.signal("SIGTERM");
+      await stopChildren(api);
     }
   });
 
@@ -374,9 +480,8 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
     const queue = `flowforge.process.integration.${randomUUID()}`;
     createdQueues.push(queue);
     const submission = await createSubmission("crash-test");
-    const healthPort = randomPort();
     const worker = startChild("src/workers/worker.ts", {
-      WORKER_HEALTH_PORT: healthPort,
+      WORKER_HEALTH_PORT: "0",
       WORKER_QUEUE: queue,
       WORKER_ROUTING_KEY: routingKey,
       WORKER_LEASE_DURATION_MS: "4000",
@@ -411,7 +516,10 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       const restoredQueue = await channel.checkQueue(queue);
       expect(restoredQueue.queue).toBe(queue);
 
-      const readiness = await getHealth(healthPort, "/health/ready");
+      const readiness = await getHealth(
+        await worker.waitForHealthPort(),
+        "/health/ready",
+      );
       expect(readiness).toMatchObject({
         status: 200,
         body: { status: "ok", database: true, rabbitmq: true, consumer: true },
@@ -434,7 +542,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       expect(recovered.jobAttempts).toHaveLength(1);
       expect(recovered.jobAttempts[0]?.status).toBe("COMPLETED");
     } finally {
-      await worker.kill();
+      await stopChildren(worker);
     }
   });
 
@@ -443,9 +551,8 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
     const queue = await createQueue(routingKey);
     const { jobId, eventId, message } = await createSubmission("crash-test");
     const producer = new JobProducer(() => channel, routingKey);
-    const healthPort = randomPort();
     const options = {
-      WORKER_HEALTH_PORT: healthPort,
+      WORKER_HEALTH_PORT: "0",
       WORKER_QUEUE: queue,
       WORKER_ROUTING_KEY: routingKey,
       WORKER_LEASE_DURATION_MS: "2000",
@@ -460,7 +567,10 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
     try {
       firstWorker = startChild("src/workers/worker.ts", options);
       await firstWorker.waitForOutput('"event":"worker.ready"');
-      const readiness = await getHealth(healthPort, "/health/ready");
+      const readiness = await getHealth(
+        await firstWorker.waitForHealthPort(),
+        "/health/ready",
+      );
       expect(readiness).toMatchObject({
         status: 200,
         body: { status: "ok", database: true, rabbitmq: true, consumer: true },
@@ -490,8 +600,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
         "COMPLETED",
       ]);
     } finally {
-      await firstWorker?.kill();
-      await recoveryWorker?.kill();
+      await stopChildren(firstWorker, recoveryWorker);
     }
   });
 
@@ -501,7 +610,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
     const first = await createSubmission("crash-test");
     const second = await createSubmission("crash-test");
     const options = {
-      WORKER_HEALTH_PORT: randomPort(),
+      WORKER_HEALTH_PORT: "0",
       WORKER_QUEUE: queue,
       WORKER_ROUTING_KEY: routingKey,
       WORKER_LEASE_DURATION_MS: "2500",
@@ -515,7 +624,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       firstWorker = startChild("src/workers/worker.ts", options);
       secondWorker = startChild("src/workers/worker.ts", {
         ...options,
-        WORKER_HEALTH_PORT: randomPort(),
+        WORKER_HEALTH_PORT: "0",
       });
       await Promise.all([
         firstWorker.waitForOutput('"event":"worker.ready"'),
@@ -551,8 +660,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
         ).toBe(1);
       }
     } finally {
-      await firstWorker?.kill();
-      await secondWorker?.kill();
+      await stopChildren(firstWorker, secondWorker);
     }
   });
 
@@ -561,7 +669,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
     const queue = await createQueue(routingKey);
     const submission = await createSubmission("crash-test");
     const options = {
-      WORKER_HEALTH_PORT: randomPort(),
+      WORKER_HEALTH_PORT: "0",
       WORKER_QUEUE: queue,
       WORKER_ROUTING_KEY: routingKey,
       WORKER_LEASE_DURATION_MS: "2000",
@@ -591,7 +699,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       recoveryWorker = startChild("src/workers/worker.ts", {
         ...options,
         WORKER_CRASH_TEST_DURATION_MS: "500",
-        WORKER_HEALTH_PORT: randomPort(),
+        WORKER_HEALTH_PORT: "0",
       });
       await recoveryWorker.waitForOutput('"event":"worker.ready"');
       await waitFor(
@@ -614,8 +722,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
         "COMPLETED",
       ]);
     } finally {
-      await stoppingWorker?.kill();
-      await recoveryWorker?.kill();
+      await stopChildren(stoppingWorker, recoveryWorker);
     }
   });
 
@@ -682,8 +789,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       if (secondMessage) {
         channel.ack(secondMessage);
       }
-      await firstRelay?.kill();
-      await secondRelay?.kill();
+      await stopChildren(firstRelay, secondRelay);
     }
   });
 
@@ -742,7 +848,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       if (message) {
         channel.ack(message);
       }
-      await relay.kill();
+      await stopChildren(relay);
     }
   });
 
@@ -759,7 +865,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       killedBefore = startChild("src/relay/relay.ts", beforeEnvironment);
       await killedBefore.waitForOutput('"event":"outbox.test_before_publish"');
       const relayReadiness = await getHealth(
-        beforeEnvironment.OUTBOX_HEALTH_PORT!,
+        await killedBefore.waitForHealthPort(),
         "/health/ready",
       );
       expect(relayReadiness).toMatchObject({
@@ -767,7 +873,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
         body: { status: "ok", database: true, rabbitmq: true, publisher: true },
       });
       const operational = await getHealth(
-        beforeEnvironment.OUTBOX_HEALTH_PORT!,
+        await killedBefore.waitForHealthPort(),
         "/health/operations",
       );
       expect(operational.body).toHaveProperty("pendingOutboxEvents");
@@ -796,8 +902,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       expect(recoveredMessage.properties.messageId).toBe(before.eventId);
       channel.ack(recoveredMessage);
     } finally {
-      await killedBefore?.kill();
-      await recoveredBefore?.kill();
+      await stopChildren(killedBefore, recoveredBefore);
     }
 
     const afterKey = `flowforge.process.relay.after.${randomUUID()}`;
@@ -845,8 +950,7 @@ describe("actual child-process recovery against isolated PostgreSQL and RabbitMQ
       if (secondCopy) {
         channel.ack(secondCopy);
       }
-      await killedAfter?.kill();
-      await recoveredAfter?.kill();
+      await stopChildren(killedAfter, recoveredAfter);
     }
   });
 });
